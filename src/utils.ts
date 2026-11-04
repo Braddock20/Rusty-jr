@@ -32,7 +32,17 @@ const TEAM_ALIASES: Record<string, string> = {
   "manchester city": "manchester city",
 
   "ss lazio": "lazio",
-  "lazio": "lazio"
+  "lazio": "lazio",
+
+  "aek athens": "aek",
+  "as monaco": "as monaco fc",
+  "as roma": "roma",
+  "arsenal fc": "arsenal",
+  "brighton and hove albion": "brighton and hove albion football club",
+  "como 1907": "como",
+  "newcastle united": "newcastle utd",
+  "sc freiburg": "s c freiburg",
+  "tottenham hotspur fc": "tottenham"
 };
 
 /**
