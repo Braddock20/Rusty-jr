@@ -90,12 +90,12 @@ function normalizeGroup(
 
 function getRetryAfterSeconds(error: unknown): number | null {
   const message = error instanceof Error ? error.message : String(error);
-  const match = message.match(/HTTP\\s+\\d+\\s*:\\s*([\\s\\S]*)/i);
+  const match = message.match(/HTTP\s+\d+\s*:\s*([\s\S]*)/i);
   if (!match) return null;
 
   try {
     const body = JSON.parse(match[1]);
-    const value = Number(body?.details?.retry_after_seconds);
+    const value = Number(body?.details?.retry_after_seconds ?? body?.retry_after_seconds);
     return Number.isFinite(value) && value >= 0 ? value : null;
   } catch {
     return null;
