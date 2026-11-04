@@ -1,0 +1,124 @@
+import type { BetikaMatch, HistoricalMatch } from "../types";
+import { cleanName } from "../utils";
+
+type SideHistory = { matches: number; wins: number; draws: number; losses: number; goalsFor: number; goalsAgainst: number };
+
+function empty(): SideHistory {
+  return { matches: 0, wins: 0, draws: 0, losses: 0, goalsFor: 0, goalsAgainst: 0 };
+}
+function add(h: SideHistory, gf: number, ga: number) {
+  h.matches++; h.goalsFor += gf; h.goalsAgainst += ga;
+  if (gf > ga) h.wins++; else if (gf === ga) h.draws++; else h.losses++;
+}
+function summarize(h: SideHistory) {
+  if (!h.matches) return { ...h, winRate: null, avgGoalsFor: null, avgGoalsAgainst: null };
+  return {
+    ...h,
+    winRate: round(h.wins / h.matches, 4),
+    avgGoalsFor: round(h.goalsFor / h.matches, 3),
+    avgGoalsAgainst: round(h.goalsAgainst / h.matches, 3)
+  };
+}
+function round(n: number, d = 3) { return Number(n.toFixed(d)); }
+
+function playerTeamHistory(history: HistoricalMatch[], playerName: string, teamName?: string | null): SideHistory {
+  const player = cleanName(playerName);
+  const team = cleanName(teamName);
+  const stats = empty();
+  for (const m of history) {
+    if (m.status !== "finished" || m.homeScore === null || m.awayScore === null) continue;
+    const hp = cleanName(m.homePlayer), ap = cleanName(m.awayPlayer);
+    const ht = cleanName(m.homeTeam), at = cleanName(m.awayTeam);
+    const homeMatch = hp === player || (!hp && ht === player);
+    const awayMatch = ap === player || (!ap && at === player);
+    if (homeMatch && (!team || !ht || ht === team)) add(stats, m.homeScore, m.awayScore);
+    else if (awayMatch && (!team || !at || at === team)) add(stats, m.awayScore, m.homeScore);
+  }
+  return stats;
+}
+
+function findPlayerHistory(history: HistoricalMatch[], playerName: string) {
+  const player = cleanName(playerName);
+  const all = empty();
+  const byTeam = new Map<string, SideHistory>();
+  for (const m of history) {
+    if (m.status !== "finished" || m.homeScore === null || m.awayScore === null) continue;
+    const hp = cleanName(m.homePlayer), ap = cleanName(m.awayPlayer);
+    for (const side of ["home", "away"] as const) {
+      const p = side === "home" ? hp : ap;
+      if (p !== player) continue;
+      const gf = side === "home" ? m.homeScore : m.awayScore;
+      const ga = side === "home" ? m.awayScore : m.homeScore;
+      add(all, gf, ga);
+      const team = side === "home" ? m.homeTeam : m.awayTeam;
+      const key = team || "team unknown";
+      if (!byTeam.has(key)) byTeam.set(key, empty());
+      add(byTeam.get(key)!, gf, ga);
+    }
+  }
+  return { overall: summarize(all), teams: [...byTeam.entries()].map(([team, stats]) => ({ team, ...summarize(stats) })) };
+}
+
+function poisson(lambda: number, k: number): number {
+  let p = Math.exp(-lambda);
+  for (let i = 1; i <= k; i++) p *= lambda / i;
+  return p;
+}
+function outcomeProbabilities(homeAvg: number, awayAvg: number) {
+  let home = 0, draw = 0, away = 0;
+  for (let h = 0; h <= 8; h++) for (let a = 0; a <= 8; a++) {
+    const p = poisson(homeAvg, h) * poisson(awayAvg, a);
+    if (h > a) home += p; else if (h === a) draw += p; else away += p;
+  }
+  const total = home + draw + away || 1;
+  return { home: round(home / total, 4), draw: round(draw / total, 4), away: round(away / total, 4) };
+}
+
+export function analyzeBetikaMatches(
+  matches: BetikaMatch[],
+  history: HistoricalMatch[],
+  providerHealth: Record<string, unknown>
+) {
+  const finished = history.filter(m => m.status === "finished" && m.homeScore !== null && m.awayScore !== null);
+  return matches.map(match => {
+    const homeProfile = findPlayerHistory(finished, match.home);
+    const awayProfile = findPlayerHistory(finished, match.away);
+    const home = homeProfile.overall;
+    const away = awayProfile.overall;
+    const sufficient = (home.matches ?? 0) >= 5 && (away.matches ?? 0) >= 5;
+    const homeFor = Number(home.avgGoalsFor ?? 1.4);
+    const awayFor = Number(away.avgGoalsFor ?? 1.4);
+    const homeAgainst = Number(home.avgGoalsAgainst ?? 1.4);
+    const awayAgainst = Number(away.avgGoalsAgainst ?? 1.4);
+    const homeLambda = Math.max(0.15, (homeFor * 0.55 + awayAgainst * 0.45));
+    const awayLambda = Math.max(0.15, (awayFor * 0.55 + homeAgainst * 0.45));
+    const probabilities = sufficient ? outcomeProbabilities(homeLambda, awayLambda) : null;
+
+    return {
+      match,
+      prediction: probabilities ? {
+        method: "historical-goal-rate Poisson baseline",
+        probabilities,
+        mostLikelyOutcome: Object.entries(probabilities).sort((a,b) => b[1] - a[1])[0][0],
+        confidence: "preliminary",
+        evidence: { homeMatches: home.matches, awayMatches: away.matches }
+      } : {
+        method: "insufficient matched player history",
+        probabilities: null,
+        mostLikelyOutcome: null,
+        confidence: "not rated",
+        evidence: { homeMatches: home.matches, awayMatches: away.matches }
+      },
+      playerIntelligence: {
+        home: { player: match.home, overall: home, byTeam: homeProfile.teams },
+        away: { player: match.away, overall: away, byTeam: awayProfile.teams }
+      },
+      dataQuality: {
+        historicalFinishedMatchesAvailable: finished.length,
+        playerNamesMatchedExactly: true,
+        warning: "Provider player identity matching is conservative and name-based in this first build. Verify aliases and player/team mappings before relying on probabilities."
+      },
+      providerHealth
+    };
+  });
+}
