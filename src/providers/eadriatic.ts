@@ -1,0 +1,225 @@
+import type { Env, HistoricalMatch, ProviderResult } from "../types";
+import { asText, asNumber, parseDate, fetchJson } from "../utils";
+
+const DEFAULT_SEASON12_URL =
+  "https://api.leaguerepublic.com/json/getMatchHub/477927459.json";
+
+function normalizeGroup(
+  group: any,
+  seasonName: string
+): HistoricalMatch[] {
+  const fixtures = Array.isArray(group?.fixtures) ? group.fixtures : [];
+  const groupName = String(group?.fixtureGroupDesc ?? "");
+  const teamFirstFormat = /^FC26\s+R\d+/i.test(groupName);
+
+  function participant(value: string | null) {
+    const match = value?.match(/^(.*?)\s*\((.*?)\)\s*$/);
+
+    if (!match) {
+      return {
+        player: null,
+        team: teamFirstFormat ? value : null,
+        affiliation: null
+      };
+    }
+
+    if (teamFirstFormat) {
+      return {
+        player: match[2].trim() || null,
+        team: match[1].trim() || null,
+        affiliation: null
+      };
+    }
+
+    return {
+      player: match[1].trim() || null,
+      team: null,
+      affiliation: match[2].trim() || null
+    };
+  }
+
+  return fixtures.map((f: any): HistoricalMatch | null => {
+    const id = asText(f?.fixtureID);
+    if (!id) return null;
+
+    const homeScore = asNumber(f?.homeScore);
+    const awayScore = asNumber(f?.roadScore);
+
+    const finished =
+      f?.approved === true &&
+      f?.result === true &&
+      homeScore !== null &&
+      awayScore !== null;
+
+    const status: HistoricalMatch["status"] = finished
+      ? "finished"
+      : homeScore === null || awayScore === null
+        ? "scheduled"
+        : "unknown";
+
+    const homeRaw = asText(f?.homeTeamName ?? f?.homeTeam);
+    const awayRaw = asText(f?.roadTeamName ?? f?.roadTeam);
+
+    const home = participant(homeRaw);
+    const away = participant(awayRaw);
+
+    return {
+      source: "eadriatic",
+      id,
+      kickoff: parseDate(
+        f?.fixtureDateInMilliseconds ?? f?.fixtureDate
+      ),
+      homePlayer: home.player,
+      awayPlayer: away.player,
+      homeTeam: home.team,
+      awayTeam: away.team,
+      homeParticipantId: asText(f?.homeTeam),
+      awayParticipantId: asText(f?.roadTeam),
+      homeAffiliation: home.affiliation,
+      awayAffiliation: away.affiliation,
+      homeScore,
+      awayScore,
+      status,
+      competition: asText(groupName) || seasonName,
+      sport: "FC26"
+    };
+  }).filter(
+    (m: HistoricalMatch | null): m is HistoricalMatch => m !== null
+  );
+}
+
+function getRetryAfterSeconds(error: unknown): number | null {
+  const message = error instanceof Error ? error.message : String(error);
+  const match = message.match(/HTTP\\s+\\d+\\s*:\\s*([\\s\\S]*)/i);
+  if (!match) return null;
+
+  try {
+    const body = JSON.parse(match[1]);
+    const value = Number(body?.details?.retry_after_seconds);
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function getEadriaticHistory(
+  env: Env
+): Promise<ProviderResult<HistoricalMatch>> {
+  const season11Url = env.EADRIATIC_MATCHHUB_URL;
+
+  if (!season11Url) {
+    return {
+      ok: false,
+      data: [],
+      error: "EADRIATIC_MATCHHUB_URL is not configured"
+    };
+  }
+
+  const season12Url =
+    env.EADRIATIC_SEASON12_URL || DEFAULT_SEASON12_URL;
+
+  const timeoutMs = Number(env.REQUEST_TIMEOUT_MS || 12000);
+
+  const sources = [
+    { season: "FC26 SEASON 11", url: season11Url },
+    { season: "FC26 SEASON 12", url: season12Url }
+  ];
+
+  const results = await Promise.all(
+    sources.map(async source => {
+      try {
+        const payload = await fetchJson(source.url, timeoutMs);
+        const groups = Array.isArray(payload?.fixtureGroupList)
+          ? payload.fixtureGroupList
+          : [];
+
+        const data = groups.flatMap((group: any) =>
+          normalizeGroup(group, source.season)
+        );
+
+        return {
+          ok: true,
+          season: source.season,
+          groups: groups.length,
+          data,
+          error: null
+        };
+      } catch (e) {
+        return {
+          ok: false,
+          season: source.season,
+          groups: 0,
+          data: [] as HistoricalMatch[],
+          error: e instanceof Error ? e.message : String(e)
+        };
+      }
+    })
+  );
+
+  const successful = results.filter(r => r.ok);
+  const retryValues = results
+    .filter(r => !r.ok)
+    .map(r => getRetryAfterSeconds(r.error))
+    .filter((value): value is number => value !== null);
+
+  const retryAfterSeconds = retryValues.length
+    ? Math.max(...retryValues)
+    : null;
+
+  const seasonStatus = results.map(r => ({
+    season: r.season,
+    ok: r.ok,
+    groups: r.groups,
+    returned: r.data.length,
+    error: r.error,
+    retryAfterSeconds: getRetryAfterSeconds(r.error)
+  }));
+
+  if (successful.length === 0) {
+    return {
+      ok: false,
+      data: [],
+      error: results.map(r => `${r.season}: ${r.error}`).join("; "),
+      meta: {
+        seasons: seasonStatus,
+        retryAfterSeconds,
+        providerStatus: "unavailable"
+      }
+    };
+  }
+
+  const unique = new Map<string, HistoricalMatch>();
+
+  for (const result of successful) {
+    for (const match of result.data) {
+      unique.set(`${match.source}:${match.id}`, match);
+    }
+  }
+
+  const data = [...unique.values()];
+
+  return {
+    ok: true,
+    data,
+    meta: {
+      seasons: seasonStatus,
+      retryAfterSeconds,
+      providerStatus:
+        successful.length === results.length ? "available" : "partially_available",
+      totalReturned: data.length,
+      finished: data.filter(m => m.status === "finished").length,
+      scheduled: data.filter(m => m.status === "scheduled").length,
+      unknown: data.filter(m => m.status === "unknown").length,
+      completionRule: "approved=true, result=true, and both scores present",
+      participantIdsAreUniversalPlayerIds: false
+    },
+    ...(successful.length !== results.length
+      ? {
+          error: results
+            .filter(r => !r.ok)
+            .map(r => `${r.season}: ${r.error}`)
+            .join("; ")
+        }
+      : {})
+  };
+}
