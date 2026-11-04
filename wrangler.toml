@@ -1,0 +1,13 @@
+name = "esoccer-intelligence"
+main = "src/index.ts"
+compatibility_date = "2026-11-04"
+
+[vars]
+BETIKA_URL = "https://api.betika.com/v1/uo/matches?page=1&limit=100&sport_id=105&period_id=-1"
+EADRIATIC_MATCHHUB_URL = "https://api.leaguerepublic.com/json/getMatchHub/656829288.json"
+EADRIATIC_SEASON12_URL = "https://api.leaguerepublic.com/json/getMatchHub/477927459.json"
+GT_FIXTURES_URL = "https://api.gtleagues.com/api/fixtures"
+GT_RECENT_LIMIT = "500"
+REQUEST_TIMEOUT_MS = "12000"
+
+GT_SCAN_OFFSETS = "280000,290000,298000,300000,302000,310000,480000,490000,498000,500000,502000,510000,540000,542000,544000"
