@@ -87,6 +87,16 @@ function isValidFinished(m: HistoricalMatch): boolean {
   );
 }
 
+function isEligibleBeforeCutoff(
+  m: HistoricalMatch,
+  cutoffMs: number
+): boolean {
+  if (!isValidFinished(m) || !m.kickoff) return false;
+
+  const kickoffMs = Date.parse(m.kickoff);
+  return Number.isFinite(kickoffMs) && kickoffMs < cutoffMs;
+}
+
 function sidePlayer(
   m: HistoricalMatch,
   side: "home" | "away"
@@ -99,6 +109,39 @@ function sideTeam(
   side: "home" | "away"
 ) {
   return side === "home" ? m.homeTeam : m.awayTeam;
+}
+
+function sideTeamId(
+  m: HistoricalMatch,
+  side: "home" | "away"
+) {
+  return side === "home" ? m.homeTeamId : m.awayTeamId;
+}
+
+function buildGtTeamIdLookup(history: HistoricalMatch[]) {
+  const idsByName = new Map<string, Set<string>>();
+
+  for (const m of history) {
+    if (m.source !== "gt" || !isValidFinished(m)) continue;
+
+    for (const side of ["home", "away"] as const) {
+      const name = canonicalTeamName(sideTeam(m, side));
+      const id = String(sideTeamId(m, side) || "").trim();
+
+      if (!name || !id) continue;
+
+      if (!idsByName.has(name)) idsByName.set(name, new Set());
+      idsByName.get(name)!.add(id);
+    }
+  }
+
+  const lookup = new Map<string, string>();
+
+  for (const [name, ids] of idsByName) {
+    if (ids.size === 1) lookup.set(name, [...ids][0]);
+  }
+
+  return lookup;
 }
 
 function sidePlayerId(
@@ -222,14 +265,22 @@ function buildPlayerProfile(
   selectedTeam: string | null,
   source: "gt" | "eadriatic",
   playerId: string | null,
-  providerAvailable: boolean
+  providerAvailable: boolean,
+  selectedTeamId: string | null = null
 ) {
   const player = cleanName(playerName);
   const selected = canonicalTeamName(selectedTeam);
+  const selectedKey = source === "gt"
+    ? selectedTeamId ? `gt:id:${selectedTeamId}` : null
+    : selected ? `eadriatic:name:${selected}` : null;
 
   const overall = empty();
   const selectedStats = empty();
-  const byTeam = new Map<string, { team: string; stats: SideHistory }>();
+  const byTeam = new Map<string, {
+    key: string;
+    team: string;
+    stats: SideHistory;
+  }>();
 
   const appearances: Array<{
     kickoff: string | null;
@@ -252,7 +303,14 @@ function buildPlayerProfile(
       if (!isThisPlayer) continue;
 
       const teamName = sideTeam(m, side);
-      const teamKey = canonicalTeamName(teamName);
+      const canonicalName = canonicalTeamName(teamName);
+      const teamId = String(sideTeamId(m, side) || "").trim();
+      const teamKey = source === "gt"
+        ? teamId
+          ? `gt:id:${teamId}`
+          : `gt:unresolved:${m.id}:${side}`
+        : `eadriatic:name:${canonicalName}`;
+      const isSelectedTeam = Boolean(selectedKey) && teamKey === selectedKey;
       const scores = sideScores(m, side);
 
       add(overall, scores.goalsFor, scores.goalsAgainst);
@@ -261,6 +319,7 @@ function buildPlayerProfile(
 
       if (!byTeam.has(teamKey)) {
         byTeam.set(teamKey, {
+          key: teamKey,
           team: displayTeam,
           stats: empty()
         });
@@ -272,7 +331,7 @@ function buildPlayerProfile(
         scores.goalsAgainst
       );
 
-      if (selected && teamKey === selected) {
+      if (isSelectedTeam) {
         add(selectedStats, scores.goalsFor, scores.goalsAgainst);
       }
 
@@ -290,7 +349,7 @@ function buildPlayerProfile(
         opponent:
           side === "home" ? m.awayPlayer : m.homePlayer
       });
-      if (selected && teamKey === selected) {
+      if (isSelectedTeam) {
         selectedTeamAppearances.push(appearances[appearances.length - 1]);
       }
     }
@@ -319,8 +378,11 @@ function buildPlayerProfile(
     overall: summarize(overall),
     selectedTeam: {
       team: selectedTeam,
-      exactTeamMatchRequired: false,
-      teamMatchPolicy: "explicit canonical aliases; no fuzzy matching",
+      teamId: source === "gt" ? selectedTeamId : null,
+      exactTeamMatchRequired: source === "gt",
+      teamMatchPolicy: source === "gt"
+        ? "unique GT team ID resolved from exact canonical team name; no fuzzy matching"
+        : "explicit canonical aliases; no fuzzy matching",
       available: providerAvailable && selectedStats.matches > 0,
       status: !providerAvailable
         ? "provider_unavailable"
@@ -339,16 +401,16 @@ function buildPlayerProfile(
       stats: summarize(selectedStats)
     },
     byTeam: [...byTeam.values()]
-      .map(({ team, stats }) => ({
+      .map(({ key, team, stats }) => ({
         team,
-        context: selected && canonicalTeamName(team) === selected
+        context: selectedKey && key === selectedKey
           ? "selected_team"
           : "other_team",
         ...summarize(stats)
       }))
       .sort((a, b) => b.matches - a.matches),
     previousTeamHistory: [...byTeam.values()]
-      .filter(({ team }) => !selected || canonicalTeamName(team) !== selected)
+      .filter(({ key }) => !selectedKey || key !== selectedKey)
       .map(({ team, stats }) => ({
         team,
         ...summarize(stats)
@@ -373,6 +435,8 @@ function headToHead(
   awayPlayerId: string | null,
   selectedHomeTeam: string | null,
   selectedAwayTeam: string | null,
+  selectedHomeTeamId: string | null,
+  selectedAwayTeamId: string | null,
   providerAvailable: boolean
 ) {
   const home = cleanName(homePlayer);
@@ -409,6 +473,43 @@ function headToHead(
       reason: "Both GT player identities must be verified"
     };
   }
+
+  const getTeamContext = (
+    m: HistoricalMatch,
+    homeIsHomeSide: boolean
+  ): "same_selected_teams" | "different_teams" | "unknown" => {
+    if (source === "gt") {
+      const historicalHomeId = String(
+        (homeIsHomeSide ? m.homeTeamId : m.awayTeamId) || ""
+      ).trim();
+      const historicalAwayId = String(
+        (homeIsHomeSide ? m.awayTeamId : m.homeTeamId) || ""
+      ).trim();
+
+      if (
+        !selectedHomeTeamId || !selectedAwayTeamId ||
+        !historicalHomeId || !historicalAwayId
+      ) return "unknown";
+
+      return historicalHomeId === selectedHomeTeamId &&
+        historicalAwayId === selectedAwayTeamId
+        ? "same_selected_teams"
+        : "different_teams";
+    }
+
+    const historicalHome = homeIsHomeSide ? m.homeTeam : m.awayTeam;
+    const historicalAway = homeIsHomeSide ? m.awayTeam : m.homeTeam;
+
+    if (
+      !selectedHomeTeam || !selectedAwayTeam ||
+      !historicalHome || !historicalAway
+    ) return "unknown";
+
+    return canonicalTeamName(historicalHome) === canonicalTeamName(selectedHomeTeam) &&
+      canonicalTeamName(historicalAway) === canonicalTeamName(selectedAwayTeam)
+      ? "same_selected_teams"
+      : "different_teams";
+  };
 
   const rows = history.filter(m => {
     if (m.source !== source || !isValidFinished(m)) return false;
@@ -451,17 +552,11 @@ function headToHead(
       homeIsHomeSide ? m.awayScore! : m.homeScore!
     );
 
-    let teamContext: "same_selected_teams" | "different_teams" | "unknown";
+    const teamContext = getTeamContext(m, homeIsHomeSide);
 
-    if (!selectedHomeTeam || !selectedAwayTeam ||
-        !homeTeamForPlayer || !awayTeamForPlayer) {
-      teamContext = "unknown";
+    if (teamContext === "unknown") {
       unknownRows.push(m);
-    } else if (
-      canonicalTeamName(homeTeamForPlayer) === canonicalTeamName(selectedHomeTeam) &&
-      canonicalTeamName(awayTeamForPlayer) === canonicalTeamName(selectedAwayTeam)
-    ) {
-      teamContext = "same_selected_teams";
+    } else if (teamContext === "same_selected_teams") {
       selectedRows.push(m);
       add(
         selectedStats,
@@ -469,7 +564,6 @@ function headToHead(
         homeIsHomeSide ? m.awayScore! : m.homeScore!
       );
     } else {
-      teamContext = "different_teams";
       crossRows.push(m);
     }
 
@@ -502,14 +596,7 @@ function headToHead(
         const homePlayerTeam = homeIsHomeSide ? m.homeTeam : m.awayTeam;
         const awayPlayerTeam = homeIsHomeSide ? m.awayTeam : m.homeTeam;
 
-        const teamContext =
-          !selectedHomeTeam || !selectedAwayTeam ||
-          !homePlayerTeam || !awayPlayerTeam
-            ? "unknown"
-            : canonicalTeamName(homePlayerTeam) === canonicalTeamName(selectedHomeTeam) &&
-              canonicalTeamName(awayPlayerTeam) === canonicalTeamName(selectedAwayTeam)
-              ? "same_selected_teams"
-              : "different_teams";
+        const teamContext = getTeamContext(m, homeIsHomeSide);
 
         return {
           date: m.kickoff,
@@ -664,7 +751,20 @@ export function analyzeBetikaMatches(
   history: HistoricalMatch[],
   providerHealth: Record<string, unknown>
 ) {
-  return matches.map(match => {
+    return matches.map(match => {
+    const nowMs = Date.now();
+    const fixtureKickoffMs = match.kickoff
+      ? Date.parse(match.kickoff)
+      : NaN;
+    const cutoffMs = Number.isFinite(fixtureKickoffMs)
+      ? Math.min(nowMs, fixtureKickoffMs)
+      : nowMs;
+
+    const eligibleHistory = history.filter(m =>
+      isEligibleBeforeCutoff(m, cutoffMs)
+    );
+
+    const gtTeamIds = buildGtTeamIdLookup(eligibleHistory);
     const source = getSource(match.competition);
 
     if (!source) {
@@ -687,18 +787,60 @@ export function analyzeBetikaMatches(
     const homePlayer = match.homePlayer || "";
     const awayPlayer = match.awayPlayer || "";
     const sourceHealth = providerHealth[source] as
-      | { ok?: boolean }
+      | {
+          ok?: boolean;
+          meta?: {
+            providerStatus?: string;
+            seasons?: Array<{
+              season?: string;
+              ok?: boolean;
+              retryAfterSeconds?: number | null;
+              error?: string | null;
+            }>;
+            retryAfterSeconds?: number | null;
+          };
+        }
       | undefined;
+
     const providerAvailable = sourceHealth?.ok === true;
+    const providerCoverage =
+      !providerAvailable
+        ? "unavailable"
+        : sourceHealth?.meta?.providerStatus === "partially_available"
+          ? "partial"
+          : "available";
+
+    const failedSeasons = (sourceHealth?.meta?.seasons || [])
+      .filter(season => season.ok === false);
+
+    const coverageWarning =
+      providerCoverage === "partial"
+        ? "Historical coverage is partial. Failed seasons: " +
+          failedSeasons.map(season =>
+            season.season +
+            (season.retryAfterSeconds != null
+              ? " (retry after " + season.retryAfterSeconds + " seconds)"
+              : "")
+          ).join(", ")
+        : providerCoverage === "unavailable"
+          ? "Historical provider unavailable. No reliable historical coverage was retrieved."
+          : null;
+
+    const homeTeamId = source === "gt"
+      ? gtTeamIds.get(canonicalTeamName(match.homeTeam)) || null
+      : null;
+    const awayTeamId = source === "gt"
+      ? gtTeamIds.get(canonicalTeamName(match.awayTeam)) || null
+      : null;
 
     const homeIdentity = getPlayerRecords(
-      history,
+      eligibleHistory,
       source,
       homePlayer
     );
 
     const awayIdentity = getPlayerRecords(
-      history,
+      eligibleHistory,
       source,
       awayPlayer
     );
@@ -709,7 +851,8 @@ export function analyzeBetikaMatches(
       match.homeTeam || null,
       source,
       homeIdentity.playerId,
-      providerAvailable
+      providerAvailable,
+      homeTeamId
     );
 
     const awayProfile = buildPlayerProfile(
@@ -718,7 +861,8 @@ export function analyzeBetikaMatches(
       match.awayTeam || null,
       source,
       awayIdentity.playerId,
-      providerAvailable
+      providerAvailable,
+      awayTeamId
     );
 
     const prediction =
@@ -792,7 +936,7 @@ export function analyzeBetikaMatches(
         }
       },
       headToHead: headToHead(
-        history,
+        eligibleHistory,
         source,
         homePlayer,
         awayPlayer,
@@ -800,16 +944,24 @@ export function analyzeBetikaMatches(
         awayIdentity.playerId,
         match.homeTeam || null,
         match.awayTeam || null,
+        homeTeamId,
+        awayTeamId,
         providerAvailable
       ),
       dataQuality: {
         historicalProviderAvailable: providerAvailable,
+        providerCoverage,
+        coverageWarning,
         historicalProviderUsed: source,
         crossProviderMixing: false,
         exactPlayerNameMatching: true,
         gtIdentityUsesUniqueSamplePlayerId: source === "gt",
-        exactTeamNameMatching: false,
-        canonicalTeamAliasMatching: true,
+        exactTeamNameMatching: source === "eadriatic",
+        canonicalTeamAliasMatching: source === "eadriatic",
+        gtTeamIdentityUsesUniqueSampleTeamId: source === "gt",
+        homeTeamIdResolved: source === "gt" ? Boolean(homeTeamId) : null,
+        awayTeamIdResolved: source === "gt" ? Boolean(awayTeamId) : null,
+        
         fuzzyMatching: false,
         homeIdentityAmbiguous: homeIdentity.ambiguous,
         awayIdentityAmbiguous: awayIdentity.ambiguous,
