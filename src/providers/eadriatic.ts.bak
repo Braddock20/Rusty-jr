@@ -1,0 +1,129 @@
+import type { Env, HistoricalMatch, ProviderResult } from "../types";
+import { asText, asNumber, parseDate, fetchJson } from "../utils";
+
+export async function getEadriaticHistory(
+  env: Env
+): Promise<ProviderResult<HistoricalMatch>> {
+  const url = env.EADRIATIC_MATCHHUB_URL;
+
+  if (!url) {
+    return {
+      ok: false,
+      data: [],
+      error: "EADRIATIC_MATCHHUB_URL is not configured"
+    };
+  }
+
+  try {
+    const payload = await fetchJson(
+      url,
+      Number(env.REQUEST_TIMEOUT_MS || 12000)
+    );
+
+    const groups = Array.isArray(payload?.fixtureGroupList)
+      ? payload.fixtureGroupList
+      : [];
+
+    const out: HistoricalMatch[] = [];
+
+    for (const group of groups) {
+      const groupName = String(group.fixtureGroupDesc ?? "");
+      const teamFirstFormat = /^FC26\s+R\d+/i.test(groupName);
+
+      for (const f of (
+        Array.isArray(group?.fixtures) ? group.fixtures : []
+      )) {
+        const homeScore = asNumber(f.homeScore);
+        const awayScore = asNumber(f.roadScore);
+
+        // eAdriatic completion requires both approval flags and valid scores.
+        const finished =
+          f.approved === true &&
+          f.result === true &&
+          homeScore !== null &&
+          awayScore !== null;
+
+        const status: HistoricalMatch["status"] = finished
+          ? "finished"
+          : homeScore === null || awayScore === null
+            ? "scheduled"
+            : "unknown";
+
+        const homeRaw = asText(f.homeTeamName ?? f.homeTeam);
+        const awayRaw = asText(f.roadTeamName ?? f.roadTeam);
+
+        function participant(value: string | null) {
+          const match = value?.match(/^(.*?)\s*\((.*?)\)\s*$/);
+
+          if (!match) {
+            return {
+              player: null,
+              team: teamFirstFormat ? value : null,
+              affiliation: null
+            };
+          }
+
+          if (teamFirstFormat) {
+            return {
+              team: match[1].trim() || null,
+              player: match[2].trim() || null,
+              affiliation: null
+            };
+          }
+
+          return {
+            player: match[1].trim() || null,
+            team: null,
+            affiliation: match[2].trim() || null
+          };
+        }
+
+        const home = participant(homeRaw);
+        const away = participant(awayRaw);
+
+        out.push({
+          source: "eadriatic",
+          id: String(f.fixtureID ?? ""),
+          kickoff: parseDate(
+            f.fixtureDateInMilliseconds ?? f.fixtureDate
+          ),
+          homePlayer: home.player,
+          awayPlayer: away.player,
+          homeTeam: home.team,
+          awayTeam: away.team,
+          homeParticipantId: asText(f.homeTeam),
+          awayParticipantId: asText(f.roadTeam),
+          homeAffiliation: home.affiliation,
+          awayAffiliation: away.affiliation,
+          homeScore,
+          awayScore,
+          status,
+          competition: asText(groupName),
+          sport: "FC26"
+        });
+      }
+    }
+
+    const data = out.filter(match => match.id);
+
+    return {
+      ok: true,
+      data,
+      meta: {
+        groups: groups.length,
+        returned: data.length,
+        finished: data.filter(m => m.status === "finished").length,
+        scheduled: data.filter(m => m.status === "scheduled").length,
+        unverifiedWithScores: data.filter(m => m.status === "unknown").length,
+        completionRule: "approved=true, result=true, and both scores present",
+        participantIds: "preserved; not assumed to be universal player IDs"
+      }
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      data: [],
+      error: e instanceof Error ? e.message : String(e)
+    };
+  }
+}
