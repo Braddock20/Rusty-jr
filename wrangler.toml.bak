@@ -1,0 +1,10 @@
+name = "esoccer-intelligence"
+main = "src/index.ts"
+compatibility_date = "2026-11-04"
+
+[vars]
+BETIKA_URL = "https://api.betika.com/v1/uo/matches?page=1&limit=100&sport_id=105&period_id=-1"
+EADRIATIC_MATCHHUB_URL = "https://api.leaguerepublic.com/json/getMatchHub/656829288.json"
+GT_FIXTURES_URL = "https://api.gtleagues.com/api/fixtures"
+GT_RECENT_LIMIT = "500"
+REQUEST_TIMEOUT_MS = "12000"
