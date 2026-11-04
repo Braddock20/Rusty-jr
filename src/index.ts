@@ -8,6 +8,19 @@ import { analyzeBetikaMatches } from "./intelligence/analyze";
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET, OPTIONS",
+          "access-control-allow-headers": "Content-Type",
+          "access-control-max-age": "86400"
+        }
+      });
+    }
+
     if (request.method !== "GET") return json({ error: "Use GET for this API" }, 405);
 
     if (url.pathname === "/" || url.pathname === "/health") {
