@@ -36,7 +36,7 @@ export default {
       ]);
       const health = {
         betika: { ok: betika.ok, count: betika.data.length, error: betika.error ?? null },
-        eadriatic: { ok: eadriatic.ok, count: eadriatic.data.length, error: eadriatic.error ?? null },
+        eadriatic: { ok: eadriatic.ok, count: eadriatic.data.length, error: eadriatic.error ?? null, meta: eadriatic.meta ?? null },
         gt: { ok: gt.ok, count: gt.data.length, error: gt.error ?? null }
       };
       if (!betika.ok) return json({ error: "Betika fixture retrieval failed", providers: health }, 502);
