@@ -9,6 +9,42 @@ export function cleanName(value: unknown): string {
     .replace(/\s+/g, " ");
 }
 
+const TEAM_ALIASES: Record<string, string> = {
+  "ac milan": "ac milan",
+  "milan": "ac milan",
+
+  "fc inter milano": "inter milan",
+  "inter": "inter milan",
+  "inter milan": "inter milan",
+  "internazionale": "inter milan",
+
+  "paris saint germain": "paris saint germain",
+  "psg": "paris saint germain",
+
+  "fc barcelona": "barcelona",
+  "barcelona": "barcelona",
+
+  "fc bayern munich": "bayern munich",
+  "bayern munich": "bayern munich",
+  "fc bayern": "bayern munich",
+
+  "manchester city fc": "manchester city",
+  "manchester city": "manchester city",
+
+  "ss lazio": "lazio",
+  "lazio": "lazio"
+};
+
+/**
+ * Canonical team key using explicit aliases only.
+ * Unknown names retain their normal cleaned form.
+ * This is not fuzzy matching.
+ */
+export function canonicalTeamName(value: unknown): string {
+  const key = cleanName(value);
+  return TEAM_ALIASES[key] || key;
+}
+
 export function asText(value: unknown): string | null {
   if (value === null || value === undefined) return null;
   const s = String(value).trim();
@@ -57,7 +93,7 @@ export async function fetchJson(url: string, timeoutMs: number, headers: Record<
   try {
     const response = await fetch(url, {
       method: "GET",
-      headers: { "accept": "application/json", ...headers },
+      headers: { "user-agent": "Mozilla/5.0", "accept": "application/json", ...headers },
       signal: controller.signal
     });
     const body = await response.text();
