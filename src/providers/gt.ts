@@ -1,0 +1,294 @@
+import type { Env, HistoricalMatch, ProviderResult } from "../types";
+import { asText, asNumber, parseDate } from "../utils";
+
+const HEADERS = {
+  origin: "https://www.gtleagues.com",
+  referer: "https://www.gtleagues.com/",
+  accept: "application/json"
+};
+
+// Bounded historical samples discovered during catalogue investigation.
+// Tifosi is deliberately excluded until a reliable player ID is found.
+const DEFAULT_OFFSETS = [
+  280000, 290000, 298000, 300000, 302000, 310000,
+  480000, 490000, 498000, 500000, 502000, 510000,
+  540000, 542000, 544000
+];
+
+function sportName(f: any): string | null {
+  return asText(
+    f?.season?.tournament?.category?.sport?.name ??
+    f?.sport?.name ??
+    f?.sportName
+  );
+}
+
+function isFcCompetition(name: string | null): boolean {
+  return !!name && /^(FC|FIFA)\s?\d{2}$/i.test(name.trim());
+}
+
+async function fetchPage(
+  url: string,
+  timeoutMs: number
+): Promise<{ response: Response; payload: any }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      headers: HEADERS,
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    return {
+      response,
+      payload: await response.json()
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function getRows(payload: any): any[] {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.data)) return payload.data;
+  return [];
+}
+
+function normalizeFixture(f: any): HistoricalMatch[] {
+  const sport = sportName(f);
+
+  if (!sport || !isFcCompetition(sport)) return [];
+  if (Number(f?.status) !== 3) return [];
+
+  const stats = f?.result?.stats || {};
+  const homeScore = asNumber(stats.home_score);
+  const awayScore = asNumber(stats.away_score);
+
+  if (
+    homeScore === null ||
+    awayScore === null ||
+    !Number.isFinite(homeScore) ||
+    !Number.isFinite(awayScore)
+  ) {
+    return [];
+  }
+
+  const participants = Array.isArray(f?.participants)
+    ? f.participants
+    : [];
+
+  const home = participants.find(
+    (p: any) => String(p?.side).toLowerCase() === "home"
+  );
+
+  const away = participants.find(
+    (p: any) => String(p?.side).toLowerCase() === "away"
+  );
+
+  if (!home || !away) return [];
+
+  const hp = home?.participant?.player;
+  const ap = away?.participant?.player;
+  const ht = home?.participant?.team;
+  const at = away?.participant?.team;
+
+  const homePlayerId = asText(hp?.id);
+  const awayPlayerId = asText(ap?.id);
+
+  // Retain all eligible fixtures in the bounded sample.
+  // This enables discovery of players from current Betika fixtures.
+  if (!homePlayerId || !awayPlayerId) return [];
+
+  return [{
+    source: "gt",
+    id: String(f?.id ?? ""),
+    kickoff: parseDate(f?.kickoff),
+    homePlayer: asText(hp?.nickname ?? hp?.name),
+    awayPlayer: asText(ap?.nickname ?? ap?.name),
+    homeTeam: asText(ht?.name),
+    awayTeam: asText(at?.name),
+    homePlayerId,
+    awayPlayerId,
+    homeTeamId: asText(ht?.id),
+    awayTeamId: asText(at?.id),
+    homeScore,
+    awayScore,
+    status: "finished",
+    competition: "GT Leagues",
+    sport
+  }];
+}
+
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+
+  async function worker() {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index]);
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(limit, items.length) },
+      () => worker()
+    )
+  );
+
+  return results;
+}
+
+export async function getGtHistory(
+  env: Env
+): Promise<ProviderResult<HistoricalMatch>> {
+  const base = env.GT_FIXTURES_URL;
+
+  if (!base) {
+    return {
+      ok: false,
+      data: [],
+      error: "GT_FIXTURES_URL is not configured"
+    };
+  }
+
+  const timeoutMs = Number(env.REQUEST_TIMEOUT_MS || 12000);
+
+  const offsetConfig = (env.GT_SCAN_OFFSETS || "").trim();
+
+  const configuredOffsets = offsetConfig
+    ? offsetConfig
+        .split(",")
+        .map(v => Number(v.trim()))
+        .filter(v => Number.isInteger(v) && v >= 0)
+    : [];
+
+  const offsets = [
+    ...new Set(
+      configuredOffsets.length
+        ? configuredOffsets
+        : DEFAULT_OFFSETS
+    )
+  ];
+
+  try {
+    const probe = await fetchPage(
+      `${base}?offset=0&limit=1&xtc=true`,
+      timeoutMs
+    );
+
+    const total = Number(
+      probe.response.headers.get("x-total-count") || 0
+    );
+
+    if (!Number.isFinite(total) || total <= 0) {
+      throw new Error("GT did not provide a valid fixture count");
+    }
+
+    const validOffsets = offsets.filter(offset => offset < total);
+
+    const pageResults = await mapLimit(
+      validOffsets,
+      3,
+      async offset => {
+        try {
+          const result = await fetchPage(
+            `${base}?offset=${offset}&limit=200&xtc=true`,
+            timeoutMs
+          );
+
+          const rows = getRows(result.payload);
+          const matches = rows.flatMap(normalizeFixture);
+
+          return {
+            offset,
+            returned: rows.length,
+            matches,
+            error: null as string | null
+          };
+        } catch (error) {
+          return {
+            offset,
+            returned: 0,
+            matches: [] as HistoricalMatch[],
+            error: error instanceof Error
+              ? error.message
+              : String(error)
+          };
+        }
+      }
+    );
+
+    const successfulPages = pageResults.filter(p => !p.error);
+
+    if (!successfulPages.length) {
+      throw new Error("All configured GT historical pages failed");
+    }
+
+    const seen = new Set<string>();
+    const data: HistoricalMatch[] = [];
+
+    for (const page of pageResults) {
+      for (const match of page.matches) {
+        if (!match.id || seen.has(match.id)) continue;
+
+        seen.add(match.id);
+        data.push(match);
+      }
+    }
+
+    data.sort((a, b) =>
+      String(a.kickoff || "").localeCompare(
+        String(b.kickoff || "")
+      )
+    );
+
+    return {
+      ok: true,
+      data,
+      meta: {
+        reportedTotal: total,
+        pageSize: 200,
+        requestedOffsets: validOffsets,
+        successfulPages: successfulPages.length,
+        failedPages: pageResults
+          .filter(p => p.error)
+          .map(p => ({
+            offset: p.offset,
+            error: p.error
+          })),
+        scannedFixtures: pageResults.reduce(
+          (sum, p) => sum + p.returned,
+          0
+        ),
+        uniqueFinishedFcFixtures: data.length,
+        playerDiscovery: "all players in bounded sampled FC/FIFA pages",
+        playerIdentityResolution: "exact nickname mapped to a unique provider player ID within the sample",
+        historyCompleteness: "bounded historical page sample; not full catalogue",
+        statusRule: "status 3 plus both scores required",
+        sportFilter: "FC/FIFA series only",
+        detailRequests: 0,
+        completeness: "bounded historical page sample; not full catalogue"
+      }
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      data: [],
+      error: error instanceof Error
+        ? error.message
+        : String(error)
+    };
+  }
+}
