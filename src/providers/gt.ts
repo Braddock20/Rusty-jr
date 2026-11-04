@@ -2,9 +2,10 @@ import type { Env, HistoricalMatch, ProviderResult } from "../types";
 import { asText, asNumber, parseDate } from "../utils";
 
 const HEADERS = {
+  "user-agent": "Mozilla/5.0",
+  accept: "application/json",
   origin: "https://www.gtleagues.com",
-  referer: "https://www.gtleagues.com/",
-  accept: "application/json"
+  referer: "https://www.gtleagues.com/"
 };
 
 // Bounded historical samples discovered during catalogue investigation.
