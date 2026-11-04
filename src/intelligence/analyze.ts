@@ -1,5 +1,5 @@
 import type { BetikaMatch, HistoricalMatch } from "../types";
-import { cleanName } from "../utils";
+import { cleanName, canonicalTeamName } from "../utils";
 
 type SideHistory = {
   matches: number;
@@ -225,11 +225,11 @@ function buildPlayerProfile(
   providerAvailable: boolean
 ) {
   const player = cleanName(playerName);
-  const selected = cleanName(selectedTeam);
+  const selected = canonicalTeamName(selectedTeam);
 
   const overall = empty();
   const selectedStats = empty();
-  const byTeam = new Map<string, SideHistory>();
+  const byTeam = new Map<string, { team: string; stats: SideHistory }>();
 
   const appearances: Array<{
     kickoff: string | null;
@@ -252,19 +252,22 @@ function buildPlayerProfile(
       if (!isThisPlayer) continue;
 
       const teamName = sideTeam(m, side);
-      const teamKey = cleanName(teamName);
+      const teamKey = canonicalTeamName(teamName);
       const scores = sideScores(m, side);
 
       add(overall, scores.goalsFor, scores.goalsAgainst);
 
       const displayTeam = teamName || "team unknown";
 
-      if (!byTeam.has(displayTeam)) {
-        byTeam.set(displayTeam, empty());
+      if (!byTeam.has(teamKey)) {
+        byTeam.set(teamKey, {
+          team: displayTeam,
+          stats: empty()
+        });
       }
 
       add(
-        byTeam.get(displayTeam)!,
+        byTeam.get(teamKey)!.stats,
         scores.goalsFor,
         scores.goalsAgainst
       );
@@ -293,9 +296,11 @@ function buildPlayerProfile(
     }
   }
 
-  appearances.sort((a, b) =>
-    String(b.kickoff || "").localeCompare(String(a.kickoff || ""))
-  );
+  const newestFirst = (a: { kickoff: string | null }, b: { kickoff: string | null }) =>
+    String(b.kickoff || "").localeCompare(String(a.kickoff || ""));
+
+  appearances.sort(newestFirst);
+  selectedTeamAppearances.sort(newestFirst);
 
   const recent = appearances.slice(0, 5);
   const recentStats = empty();
@@ -314,7 +319,8 @@ function buildPlayerProfile(
     overall: summarize(overall),
     selectedTeam: {
       team: selectedTeam,
-      exactTeamMatchRequired: true,
+      exactTeamMatchRequired: false,
+      teamMatchPolicy: "explicit canonical aliases; no fuzzy matching",
       available: providerAvailable && selectedStats.matches > 0,
       status: !providerAvailable
         ? "provider_unavailable"
@@ -328,14 +334,26 @@ function buildPlayerProfile(
         : overall.matches === 0
           ? "No completed history for this player was found in the available sample"
           : selectedStats.matches === 0
-            ? "Player history exists, but no completed matches were found for this exact team"
+            ? "Player history exists, but no completed matches were found for this team or its recognized aliases"
             : null,
       stats: summarize(selectedStats)
     },
-    byTeam: [...byTeam.entries()].map(([team, stats]) => ({
-      team,
-      ...summarize(stats)
-    })),
+    byTeam: [...byTeam.values()]
+      .map(({ team, stats }) => ({
+        team,
+        context: selected && canonicalTeamName(team) === selected
+          ? "selected_team"
+          : "other_team",
+        ...summarize(stats)
+      }))
+      .sort((a, b) => b.matches - a.matches),
+    previousTeamHistory: [...byTeam.values()]
+      .filter(({ team }) => !selected || canonicalTeamName(team) !== selected)
+      .map(({ team, stats }) => ({
+        team,
+        ...summarize(stats)
+      }))
+      .sort((a, b) => b.matches - a.matches),
     recentForm: {
       lastFive: recent,
       stats: summarize(recentStats),
@@ -440,8 +458,8 @@ function headToHead(
       teamContext = "unknown";
       unknownRows.push(m);
     } else if (
-      cleanName(homeTeamForPlayer) === cleanName(selectedHomeTeam) &&
-      cleanName(awayTeamForPlayer) === cleanName(selectedAwayTeam)
+      canonicalTeamName(homeTeamForPlayer) === canonicalTeamName(selectedHomeTeam) &&
+      canonicalTeamName(awayTeamForPlayer) === canonicalTeamName(selectedAwayTeam)
     ) {
       teamContext = "same_selected_teams";
       selectedRows.push(m);
@@ -488,8 +506,8 @@ function headToHead(
           !selectedHomeTeam || !selectedAwayTeam ||
           !homePlayerTeam || !awayPlayerTeam
             ? "unknown"
-            : cleanName(homePlayerTeam) === cleanName(selectedHomeTeam) &&
-              cleanName(awayPlayerTeam) === cleanName(selectedAwayTeam)
+            : canonicalTeamName(homePlayerTeam) === canonicalTeamName(selectedHomeTeam) &&
+              canonicalTeamName(awayPlayerTeam) === canonicalTeamName(selectedAwayTeam)
               ? "same_selected_teams"
               : "different_teams";
 
@@ -635,7 +653,7 @@ function predict(
     },
     limitations: [
       "Historical sample size limits reliability",
-      "Exact team names are required",
+      "Explicit canonical team aliases are supported; fuzzy matching is disabled",
       "Probabilities are statistical estimates, not guarantees"
     ]
   };
@@ -757,6 +775,7 @@ export function analyzeBetikaMatches(
           identityMethod: homeIdentity.identityMethod,
           overall: homeProfile.overall,
           selectedTeamHistory: homeProfile.selectedTeam,
+          previousTeamHistory: homeProfile.previousTeamHistory,
           byTeam: homeProfile.byTeam,
           recentForm: homeProfile.recentForm
         },
@@ -767,6 +786,7 @@ export function analyzeBetikaMatches(
           identityMethod: awayIdentity.identityMethod,
           overall: awayProfile.overall,
           selectedTeamHistory: awayProfile.selectedTeam,
+          previousTeamHistory: awayProfile.previousTeamHistory,
           byTeam: awayProfile.byTeam,
           recentForm: awayProfile.recentForm
         }
@@ -788,7 +808,8 @@ export function analyzeBetikaMatches(
         crossProviderMixing: false,
         exactPlayerNameMatching: true,
         gtIdentityUsesUniqueSamplePlayerId: source === "gt",
-        exactTeamNameMatching: true,
+        exactTeamNameMatching: false,
+        canonicalTeamAliasMatching: true,
         fuzzyMatching: false,
         homeIdentityAmbiguous: homeIdentity.ambiguous,
         awayIdentityAmbiguous: awayIdentity.ambiguous,
@@ -797,7 +818,7 @@ export function analyzeBetikaMatches(
             ? "Bounded sampled GT catalogue pages; not complete player career history"
             : null,
         warning:
-          "GT identities must resolve to one provider player ID within the bounded sample. eAdriatic uses exact player names. Exact team names are required. Missing or mismatched team evidence is never substituted with another team's results."
+          "GT identities must resolve to one provider player ID within the bounded sample. eAdriatic uses exact player names. Explicit canonical team aliases are recognized. Fuzzy matching is disabled. Missing or mismatched team evidence is never substituted with another team's results."
       },
       providerHealth
     };
