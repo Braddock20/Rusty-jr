@@ -71,6 +71,7 @@ async function main() {
     console.log(JSON.stringify({
       fixture: {
         competition: item.match.competition,
+        kickoff: item.match.kickoff,
         home: item.match.home,
         away: item.match.away,
         homePlayer: item.match.homePlayer,
